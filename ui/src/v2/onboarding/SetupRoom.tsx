@@ -1,16 +1,16 @@
 import React, { useEffect, useState } from "react";
-import { ArrowRight, Check, Loader2, Volume2, VolumeX, type LucideIcon } from "lucide-react";
+import { ArrowRight, Check, Loader2, Mic, MicOff, Volume2, VolumeX, type LucideIcon } from "lucide-react";
 import { Button, Icon } from "../ui";
 import "./SetupRoom.css";
 
 /**
- * Phase A — first-run setup. Two screens, then `POST /api/onboarding/setup`
- * which atomically saves LLM + TTS + flips the completion flag. Daemon
+ * Phase A — first-run setup. Three screens, then `POST /api/onboarding/setup`
+ * which atomically saves LLM + STT + TTS + flips the completion flag. Daemon
  * hot-reloads providers; gate refetches status; we fall through to the
  * normal AppShell (or to Phase B once that's built).
  *
  * Deliberately self-contained — no Settings Room hook reuse — because
- * setup runs BEFORE the daemon has any LLM/TTS state to read, and the
+ * setup runs BEFORE the daemon has any LLM/STT/TTS state to read, and the
  * tabbed Settings UI's polling would hammer 503s. Reuses only the v2
  * tokens + Button primitive.
  */
@@ -115,6 +115,10 @@ const PROVIDERS: ReadonlyArray<{
   },
 ];
 
+type STTChoice = "skip" | "openai" | "groq" | "local";
+
+type LocalSTTServer = "whisper_cpp" | "openai_compatible";
+
 type TTSChoice = "off" | "edge" | "elevenlabs";
 
 const EDGE_VOICES = [
@@ -127,7 +131,7 @@ const EDGE_VOICES = [
 ];
 
 export function SetupRoom({ onComplete }: { onComplete: () => void }) {
-  const [screen, setScreen] = useState<"llm" | "tts">("llm");
+  const [screen, setScreen] = useState<"llm" | "stt" | "tts">("llm");
 
   // ── LLM screen state ───────────────────────────────────────────────
   const [providerId, setProviderId] = useState<LLMProviderId>("anthropic");
@@ -187,6 +191,18 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
       setModel(preferred);
     }
   }, [nvidiaModels, providerId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── STT screen state ───────────────────────────────────────────────
+  // Default to "skip" so users who only want text chat aren't forced to
+  // hand over a Whisper key on first run. They can wire STT later from
+  // Settings → Channels.
+  const [sttChoice, setSttChoice] = useState<STTChoice>("skip");
+  const [sttKey, setSttKey] = useState("");
+  // Matches LocalWhisperSTT's constructor default in src/comms/voice.ts so
+  // a user who accepts the suggested endpoint hits a working whisper.cpp
+  // server out of the box. Keep these in sync if either changes.
+  const [sttLocalEndpoint, setSttLocalEndpoint] = useState("http://localhost:8080");
+  const [sttLocalServer, setSttLocalServer] = useState<LocalSTTServer>("whisper_cpp");
 
   // ── TTS screen state ───────────────────────────────────────────────
   const [ttsChoice, setTtsChoice] = useState<TTSChoice>("edge");
@@ -255,6 +271,16 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
 
   const llmReady = testResult?.ok === true;
 
+  // Gate the STT Continue button so we never persist a cloud provider with
+  // no key (which fails at first transcription) or a local endpoint of "".
+  // Skip is always ready — it just omits the stt block from the payload.
+  const sttReady =
+    sttChoice === "skip"
+      ? true
+      : sttChoice === "local"
+        ? sttLocalEndpoint.trim() !== ""
+        : sttKey.trim() !== "";
+
   const handleFinish = async () => {
     setSaving(true);
     setSaveError(null);
@@ -281,10 +307,28 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
         if (elevenKey) ttsBlock.elevenlabs = { api_key: elevenKey };
       }
 
+      // Build the STT payload — omitted entirely when the user skipped so
+      // the backend leaves the default config untouched. The backend
+      // mirrors /api/config/stt POST semantics (preserves existing keys
+      // when a sub-block omits api_key).
+      const payload: Record<string, unknown> = { llm: llmBlock, tts: ttsBlock };
+      if (sttChoice !== "skip") {
+        const sttBlock: Record<string, unknown> = { provider: sttChoice };
+        if (sttChoice === "openai" || sttChoice === "groq") {
+          if (sttKey) sttBlock[sttChoice] = { api_key: sttKey };
+        } else if (sttChoice === "local") {
+          sttBlock.local = {
+            endpoint: sttLocalEndpoint.trim(),
+            server_type: sttLocalServer,
+          };
+        }
+        payload.stt = sttBlock;
+      }
+
       const r = await fetch("/api/onboarding/setup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ llm: llmBlock, tts: ttsBlock }),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) {
         const text = await r.text().catch(() => `HTTP ${r.status}`);
@@ -314,9 +358,17 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
             <div className="v2-setup__progress-sep">·</div>
             <div
               className="v2-setup__progress-step"
+              data-active={screen === "stt"}
+              data-done={screen === "tts"}
+            >
+              2 · Voice In
+            </div>
+            <div className="v2-setup__progress-sep">·</div>
+            <div
+              className="v2-setup__progress-step"
               data-active={screen === "tts"}
             >
-              2 · Voice
+              3 · Voice Out
             </div>
           </div>
         </header>
@@ -573,8 +625,124 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
               <Button
                 variant="primary"
                 size="md"
-                onClick={() => setScreen("tts")}
+                onClick={() => setScreen("stt")}
                 disabled={!llmReady}
+              >
+                Continue
+                <Icon icon={ArrowRight} size="sm" />
+              </Button>
+            </div>
+          </section>
+        ) : screen === "stt" ? (
+          <section className="v2-setup__screen">
+            <h1 className="v2-setup__title">How should Jarvis hear you?</h1>
+            <p className="v2-setup__sub">
+              Speech-to-text powers voice messages and the mic button. Skip
+              for now if you only plan to type — you can wire this up later
+              in Settings → Channels.
+            </p>
+
+            <div className="v2-setup__tts-grid" role="radiogroup">
+              <ChoiceCard
+                id="skip"
+                active={sttChoice === "skip"}
+                onClick={() => setSttChoice("skip")}
+                icon={MicOff}
+                title="Skip for now"
+                body="Text only. Wire up STT later from Settings."
+              />
+              <ChoiceCard
+                id="openai"
+                active={sttChoice === "openai"}
+                onClick={() => setSttChoice("openai")}
+                icon={Mic}
+                title="OpenAI Whisper"
+                body="Cloud Whisper. Accurate, needs an OpenAI API key."
+              />
+              <ChoiceCard
+                id="groq"
+                active={sttChoice === "groq"}
+                onClick={() => setSttChoice("groq")}
+                icon={Mic}
+                title="Groq Whisper"
+                body="Fastest hosted Whisper. Needs a Groq API key."
+              />
+              <ChoiceCard
+                id="local"
+                active={sttChoice === "local"}
+                onClick={() => setSttChoice("local")}
+                icon={Mic}
+                title="Local Whisper.cpp"
+                body="Self-hosted on your machine. No API key needed."
+              />
+            </div>
+
+            {(sttChoice === "openai" || sttChoice === "groq") && (
+              <div className="v2-setup__field">
+                <label className="v2-setup__label" htmlFor="setup-stt-key">
+                  {sttChoice === "openai" ? "OpenAI" : "Groq"} API key
+                </label>
+                <input
+                  id="setup-stt-key"
+                  className="v2-setup__input"
+                  type="password"
+                  value={sttKey}
+                  onChange={(e) => setSttKey(e.target.value)}
+                  placeholder="paste your key"
+                  autoComplete="off"
+                />
+                <p className="v2-setup__hint">
+                  Stored locally in your JARVIS config — never sent anywhere
+                  except {sttChoice === "openai" ? "OpenAI" : "Groq"}.
+                </p>
+              </div>
+            )}
+
+            {sttChoice === "local" && (
+              <>
+                <div className="v2-setup__field">
+                  <label className="v2-setup__label" htmlFor="setup-stt-endpoint">
+                    Whisper endpoint
+                  </label>
+                  <input
+                    id="setup-stt-endpoint"
+                    className="v2-setup__input"
+                    value={sttLocalEndpoint}
+                    onChange={(e) => setSttLocalEndpoint(e.target.value)}
+                    placeholder="http://localhost:8080"
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="v2-setup__field">
+                  <label className="v2-setup__label" htmlFor="setup-stt-server">
+                    Server type
+                  </label>
+                  <select
+                    id="setup-stt-server"
+                    className="v2-setup__select"
+                    value={sttLocalServer}
+                    onChange={(e) => setSttLocalServer(e.target.value as LocalSTTServer)}
+                  >
+                    <option value="whisper_cpp">whisper.cpp</option>
+                    <option value="openai_compatible">OpenAI-compatible</option>
+                  </select>
+                </div>
+              </>
+            )}
+
+            <div className="v2-setup__cta-row">
+              <Button
+                variant="ghost"
+                size="md"
+                onClick={() => setScreen("llm")}
+              >
+                ← Back
+              </Button>
+              <Button
+                variant="primary"
+                size="md"
+                onClick={() => setScreen("tts")}
+                disabled={!sttReady}
               >
                 Continue
                 <Icon icon={ArrowRight} size="sm" />
@@ -590,7 +758,7 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
             </p>
 
             <div className="v2-setup__tts-grid" role="radiogroup">
-              <TTSCard
+              <ChoiceCard
                 id="off"
                 active={ttsChoice === "off"}
                 onClick={() => setTtsChoice("off")}
@@ -598,7 +766,7 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
                 title="No voice"
                 body="Text replies only. Lightest option."
               />
-              <TTSCard
+              <ChoiceCard
                 id="edge"
                 active={ttsChoice === "edge"}
                 onClick={() => setTtsChoice("edge")}
@@ -606,7 +774,7 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
                 title="Edge TTS"
                 body="Free, clean, ships with Jarvis. Pick a voice below."
               />
-              <TTSCard
+              <ChoiceCard
                 id="elevenlabs"
                 active={ttsChoice === "elevenlabs"}
                 onClick={() => setTtsChoice("elevenlabs")}
@@ -667,7 +835,7 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
               <Button
                 variant="ghost"
                 size="md"
-                onClick={() => setScreen("llm")}
+                onClick={() => setScreen("stt")}
                 disabled={saving}
               >
                 ← Back
@@ -698,7 +866,7 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
   );
 }
 
-function TTSCard({
+function ChoiceCard({
   active,
   onClick,
   icon,
@@ -729,3 +897,4 @@ function TTSCard({
     </button>
   );
 }
+
